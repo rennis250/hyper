@@ -1,0 +1,440 @@
+extern crate image;
+extern crate nalgebra;
+extern crate csv;
+extern crate byteorder;
+extern crate arrayfire as af;
+
+use std::path::Path;
+use std::fs::File;
+use std::io::{BufReader, BufRead, Read, Write, Cursor};
+use std::iter::FromIterator;
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+
+use image::GenericImage;
+use nalgebra::Matrix3;
+
+use af::*;
+
+mod hyper {
+    use super::*;
+
+    #[derive(Debug)]
+    pub struct Hyper {
+        data: Vec<u16>,
+        cal_data: Vec<f32>,
+        pub xyz: Vec<f32>,
+        pub rgb: Vec<f32>,
+        rad_corr: Vec<f64>,
+        pub lines: usize,
+        pub samples: usize,
+        bands: usize,
+        adsline: usize,
+        specb: usize,
+        spatb: usize,
+        tint: f64,
+        wln: Vec<f64>,
+        rads: f64,
+        erads: f64,
+        pub fname: String,
+    }
+
+    impl Hyper {
+        pub fn new() -> Hyper {
+            Hyper {
+                data: vec![0u16; 0],
+                cal_data: vec![0f32; 0],
+                xyz: vec![0f32; 0],
+                rgb: vec![0f32; 0],
+                rad_corr: vec![0f64; 0],
+                lines: 0usize,
+                samples: 0usize,
+                bands: 0usize,
+                adsline: 0usize,
+                specb: 0usize,
+                spatb: 0usize,
+                tint: 0f64,
+                wln: vec![0f64; 0],
+                rads: 1000f64,
+                erads: 1000f64,
+                fname: "".to_string(),
+            }
+        }
+
+        pub fn parse_header(&mut self) {
+            let mut wlnc = 0;
+
+            let mut processing_wavelengths = false;
+            let file = File::open(&self.fname).unwrap();
+            for line in BufReader::new(file).lines() {
+                let l = line.unwrap();
+                if !processing_wavelengths {
+                    if l.starts_with("samples = ") {
+                        self.samples =
+                            l.split_whitespace().nth(2).unwrap().parse::<usize>().unwrap();
+                    }
+                    if l.starts_with("lines   = ") {
+                        self.lines = l.split_whitespace().nth(2).unwrap().parse::<usize>().unwrap();
+                    }
+                    if l.starts_with("bands = ") {
+                        self.bands = l.split_whitespace().nth(2).unwrap().parse::<usize>().unwrap();
+                        self.wln = vec![0f64; self.bands];
+                    }
+                    if l.starts_with("autodarkstartline   = ") {
+                        self.adsline =
+                            l.split_whitespace().nth(2).unwrap().parse::<usize>().unwrap();
+                    }
+                    if l.starts_with("binning = {") {
+                        self.specb = l.split(',')
+                            .nth(0)
+                            .unwrap()
+                            .split('{')
+                            .nth(1)
+                            .unwrap()
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap();
+                        self.spatb = l.split(',')
+                            .nth(1)
+                            .unwrap()
+                            .split('}')
+                            .nth(0)
+                            .unwrap()
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap();
+                    }
+                    if l.starts_with("tint =  ") {
+                        self.tint = l.split_whitespace().nth(2).unwrap().parse::<f64>().unwrap();
+                    }
+                    if l.starts_with("Wavelength = { ") {
+                        processing_wavelengths = true;
+                    }
+                } else {
+                    if l.starts_with("}") {
+                        break;
+                    }
+                    self.wln[wlnc] = l.split(',').nth(0).unwrap().trim().parse::<f64>().unwrap();
+                    wlnc += 1;
+                }
+            }
+        }
+
+        pub fn read_cal(&mut self) {
+            let mut samples: usize = 0;
+            let mut bands: usize = 0;
+
+            let file = File::open("Radiometric_calibration_1x1_Scanner.hdr").unwrap();
+            for line in BufReader::new(file).lines() {
+                let l = line.unwrap();
+                if l.starts_with("samples = ") {
+                    samples = l.split_whitespace().nth(2).unwrap().parse::<usize>().unwrap();
+                }
+                if l.starts_with("bands = ") {
+                    bands = l.split_whitespace().nth(2).unwrap().parse::<usize>().unwrap();
+                }
+            }
+
+            let mut cald = vec![0f32; samples * bands];
+
+            let mut file = File::open("Radiometric_calibration_1x1_Scanner.cal").unwrap();
+            let file_len = file.metadata().unwrap().len();
+            let mut bytes: Vec<u8> = Vec::with_capacity(file_len as usize + 1);
+            file.read_to_end(&mut bytes).unwrap();
+            let mut rdr = Cursor::new(bytes);
+            for x in cald.iter_mut() {
+                *x = rdr.read_f32::<LittleEndian>().unwrap();
+            }
+            // let d: &[f32] = unsafe {
+            // std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
+            // };
+
+            // let mut cald = d.to_vec();
+
+            cald[0] = cald[samples];
+            cald[1] = cald[samples + 1];
+
+            if samples == 1600 && bands == 800 && self.specb != 1 && self.spatb != 1 {
+                let bbands = bands / self.specb;
+                let bsamples = samples / self.spatb;
+
+                let mut binned_cal_file = vec![0f64; bsamples * bbands];
+
+                let mut spatc = 0;
+                let mut specc = 0;
+                for wln in (0..(bands - self.specb)).filter(|x| (x % self.specb == 0)) {
+                    for y in (0..(samples - self.spatb)).filter(|x| (x % self.spatb == 0)) {
+                        let mut accum = 0.0;
+                        for wlns in 0..self.specb {
+                            for ys in 0..self.spatb {
+                                accum += cald[(wln + wlns) * samples + y + ys] as f64;
+                            }
+                        }
+                        binned_cal_file[specc * bsamples + spatc] =
+                            accum / (self.spatb * self.specb) as f64;
+                        spatc += 1;
+                    }
+                    spatc = 0;
+                    specc += 1;
+                }
+
+                self.rad_corr = binned_cal_file;
+
+                return;
+            }
+
+            // self.rad_corr = cald;
+        }
+
+        pub fn read_raw(&mut self) {
+            let nelems = self.samples * self.bands * (self.adsline + 1);
+            self.cal_data = vec![0f32; nelems];
+
+            let nelems = self.samples * self.bands * self.lines;
+            self.data = vec![0u16; nelems];
+
+            let mut file = File::open("mcChip_1_28_D65.raw").unwrap();
+            let file_len = file.metadata().unwrap().len();
+            let mut bytes: Vec<u8> = Vec::with_capacity(file_len as usize + 1);
+            file.read_to_end(&mut bytes).unwrap();
+            let mut rdr = Cursor::new(bytes);
+            for x in self.data.iter_mut() {
+                *x = rdr.read_u16::<LittleEndian>().unwrap();
+            }
+            self.data[0] = 0;
+        }
+
+        pub fn calibrate_raw(&mut self) {
+            let corr_factor = 1.0e-5 / (self.tint / (self.rads / (self.spatb * self.specb) as f64));
+
+            self.rad_corr = self.rad_corr.iter().map(|&x| x * corr_factor).collect();
+
+            let mut idx = 0;
+            let mut accum = 0.0f64;
+            let den = (self.lines - self.adsline - 1) as f64;
+            for y in 0..self.bands {
+                for z in 0..self.samples {
+                    accum = 0.0;
+                    for x in (0..self.lines).rev() {
+                        idx = x * self.bands * self.samples + y * self.samples + z;
+                        if x > self.adsline {
+                            accum += self.data[idx] as f64;
+                        } else {
+                            self.cal_data[idx] = (self.rad_corr[y * self.samples + z] *
+                                                  ((self.data[idx] as f64) - (accum / den))) as
+                                                 f32;
+                        }
+                    }
+                }
+            }
+
+            self.cal_data = self.cal_data
+                .iter()
+                .map(|&x| if x < 0.0 { 0.0 } else { x })
+                .collect();
+
+            self.lines = self.adsline - 1;
+
+            return;
+        }
+
+        pub fn write_dat(&self) {
+            let mut file = File::create("mcChip_1_28_D65.dat").unwrap();
+            let mut edata: &[u16] =
+                &(self.cal_data.iter().map(|&x| (x * 1000.0) as u16).collect::<Vec<_>>());
+            let mut wtr = vec![];
+            for x in edata {
+                wtr.write_u16::<LittleEndian>(*x).unwrap();
+            }
+            file.write_all(&mut wtr).unwrap();
+            file.flush().unwrap();
+        }
+
+        pub fn xyz_to_rgb(&mut self) {
+            // -> image::ImageBuffer<image::Rgba<u8>, Vec<u8>> {
+            let mut monxyYx: Vec<f32> = Vec::new();
+            let mut monxyYy: Vec<f32> = Vec::new();
+            let mut monxyYY: Vec<f32> = Vec::new();
+
+            let mut rdr =
+                csv::Reader::from_file(&Path::new("OLEDxyY.csv")).unwrap().has_headers(false);
+            for record in rdr.decode() {
+                let (x, y, Y): (f32, f32, f32) = record.unwrap();
+                monxyYx.push(x);
+                monxyYy.push(y);
+                monxyYY.push(Y);
+            }
+
+            let mut monxyzx = vec![0f32; 3];
+            let mut monxyzy = vec![0f32; 3];
+            let mut monxyzz = vec![0f32; 3];
+
+            for i in 0..3 {
+                monxyzx[i] = (monxyYY[i] / monxyYy[i]) * monxyYx[i];
+                monxyzy[i] = monxyYY[i];
+                monxyzz[i] = (monxyYY[i] / monxyYy[i]) * (1.0 - monxyYx[i] - monxyYy[i]);
+            }
+
+            let matrix = Matrix3::new(monxyzx[0],
+                                      monxyzx[1],
+                                      monxyzx[2],
+                                      monxyzy[0],
+                                      monxyzy[1],
+                                      monxyzy[2],
+                                      monxyzz[0],
+                                      monxyzz[1],
+                                      monxyzz[2]);
+            let monXYZ2RGB = matrix.try_inverse().unwrap();
+
+            let mut rgb = vec![0f32; self.lines * self.samples * 3];
+
+            let mut bidx = 0;
+            let A = vec![1.0267, 0.9983, 1.0337];
+            let B = vec![2.2546, 2.2473, 2.2121];
+            let mut r = 0.0;
+            let mut g = 0.0;
+            let mut b = 0.0;
+            for x in 0..self.lines {
+                for z in 0..self.samples {
+                    bidx = x * self.samples * 3 + z * 3;
+                    r = monXYZ2RGB[(0, 0)] * self.xyz[bidx] +
+                        monXYZ2RGB[(0, 1)] * self.xyz[bidx + 1] +
+                        monXYZ2RGB[(0, 2)] * self.xyz[bidx + 2];
+                    g = monXYZ2RGB[(1, 0)] * self.xyz[bidx] +
+                        monXYZ2RGB[(1, 1)] * self.xyz[bidx + 1] +
+                        monXYZ2RGB[(1, 2)] * self.xyz[bidx + 2];
+                    b = monXYZ2RGB[(2, 0)] * self.xyz[bidx] +
+                        monXYZ2RGB[(2, 1)] * self.xyz[bidx + 1] +
+                        monXYZ2RGB[(2, 2)] * self.xyz[bidx + 2];
+                    rgb[bidx] = r.powf(1.0 / B[0]) / A[0];
+                    rgb[bidx + 1] = g.powf(1.0 / B[1]) / A[1];
+                    rgb[bidx + 2] = b.powf(1.0 / B[2]) / A[2];
+                }
+            }
+
+            self.rgb = rgb.iter().map(|&x| if x < 0.0 { 0.0 } else { x }).collect();
+
+            // let white = (255u8, 255u8, 255u8, 255u8);
+            // let (w, h) = (self.lines as u32, self.samples as u32);
+            // let mut imgbuf = image::ImageBuffer::from_fn(w, h, |x, y| {
+            //     image::Rgba([white.0, white.1, white.2, white.3])
+            // });
+            // let mut bidx = 0usize;
+            // for x in 0..self.lines {
+            //     for y in 0..self.samples {
+            //         bidx = x * self.samples * 3 + y * 3;
+            //         let c = ((rgb[bidx] * 255.0) as u8,
+            //                  (rgb[bidx + 1] * 255.0) as u8,
+            //                  (rgb[bidx + 2] * 255.0) as u8,
+            //                  255u8);
+            //         imgbuf.put_pixel(x as u32,
+            //                          y as u32,
+            //                          image::Pixel::from_channels(c.0 as u8,
+            //                                                      c.1 as u8,
+            //                                                      c.2 as u8,
+            //                                                      c.3 as u8));
+            //     }
+            // }
+
+            // imgbuf
+        }
+
+        pub fn raw_to_rgb(&mut self) {
+            // -> image::ImageBuffer<image::Rgba<u8>, Vec<u8>> {
+            let mut ciex: Vec<f32> = Vec::new();
+            let mut ciey: Vec<f32> = Vec::new();
+            let mut ciez: Vec<f32> = Vec::new();
+
+            let mut rdr =
+                csv::Reader::from_file(&Path::new("corrCMF.csv")).unwrap().has_headers(false);
+
+            let x = 0;
+            for record in rdr.decode() {
+                let (x, y, z): (f32, f32, f32) = record.unwrap();
+                ciex.push(x);
+                ciey.push(y);
+                ciez.push(z);
+            }
+
+            let mut xyz = vec![0f32; self.lines * self.samples * 3];
+
+            let mut idx = 0;
+            let mut accumx = 0.0;
+            let mut accumy = 0.0;
+            let mut accumz = 0.0;
+            for x in 0..self.lines {
+                for z in 0..self.samples {
+                    accumx = 0.0;
+                    accumy = 0.0;
+                    accumz = 0.0;
+                    for (y, v) in ciex.iter().enumerate() {
+                        idx = x * self.bands * self.samples + (y + 4) * self.samples + z;
+                        accumx += *v * self.cal_data[idx];
+                        accumy += ciey[y] * self.cal_data[idx];
+                        accumz += ciez[y] * self.cal_data[idx];
+                    }
+                    xyz[x * self.samples * 3 + z * 3] = accumx;
+                    xyz[x * self.samples * 3 + z * 3 + 1] = accumy;
+                    xyz[x * self.samples * 3 + z * 3 + 2] = accumz;
+                }
+            }
+
+            self.xyz = xyz.iter().map(|&x| if x < 0.0 { 0.0 } else { x }).collect();
+            self.xyz_to_rgb()
+        }
+    }
+}
+
+fn main() {
+    set_backend(Backend::CPU);
+
+    let args: Vec<String> = std::env::args().collect();
+
+    let mut h = hyper::Hyper::new();
+
+    h.fname = args[1].clone();
+
+    h.parse_header();
+    h.read_cal();
+    h.read_raw();
+    h.calibrate_raw();
+    h.write_dat();
+    h.raw_to_rgb();
+
+    let r = Array::new(&h.rgb,
+                       Dim4::new(&[h.samples as u64, h.lines as u64, 3 as u64, 1 as u64]));
+    let seqs = &[Seq::new(1.0, 1.0, 1.0),
+                Seq::new(1.0, 1.0, 1.0),
+                Seq::new(1.0, 1.0, 1.0),
+                Seq::default()];
+    let sub = index(&r, seqs);
+    save_image_native("img.png".to_string(), &r);
+
+    // let ref mut fout = File::create(&Path::new("img.png")).unwrap();
+    // let _ = image::ImageRgba8(gr).save(fout, image::PNG);
+
+    // let white = (255u8, 255u8, 255u8, 255u8);
+    // let (w, hei) = (h.lines as u32, h.samples as u32);
+    // let mut imgbuf = image::ImageBuffer::from_fn(w, hei, |x, y| {
+    //     image::Rgba([white.0, white.1, white.2, white.3])
+    // });
+    // let mut bidx = 0usize;
+    // for x in 0..h.lines {
+    //     for y in 0..h.samples {
+    //         bidx = x * h.samples * 3 + y * 3;
+    //         let c = ((h.xyz[bidx] * 255.0) as u8,
+    //                  (h.xyz[bidx + 1] * 255.0) as u8,
+    //                  (h.xyz[bidx + 2] * 255.0) as u8,
+    //                  255u8);
+    //         imgbuf.put_pixel(x as u32,
+    //                          y as u32,
+    //                          image::Pixel::from_channels(c.0 as u8,
+    //                                                      c.1 as u8,
+    //                                                      c.2 as u8,
+    //                                                      c.3 as u8));
+    //     }
+    // }
+
+    // let ref mut fout = File::create(&Path::new("imgXYZ.png")).unwrap();
+    // let _ = image::ImageRgba8(imgbuf).save(fout, image::PNG);
+}

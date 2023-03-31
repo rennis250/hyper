@@ -1,0 +1,11 @@
+[package]
+name = "hyper"
+version = "0.1.0"
+authors = ["Robert J Ennis <rje@sdf.org>"]
+
+[dependencies]
+nalgebra = "*"
+csv = "*"
+byteorder = "*"
+lodepng = "*"
+num-traits = "*"
